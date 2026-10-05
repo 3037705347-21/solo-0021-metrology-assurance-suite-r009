@@ -14,9 +14,12 @@ type EvidenceSeal struct {
 	Reviewer      string    `json:"reviewer"`
 	Summary       string    `json:"summary"`
 	SealedAt      time.Time `json:"sealed_at"`
+	// Uncertainty is the frozen measurement-uncertainty basis reviewed at seal
+	// time. Later revisions never touch this copy.
+	Uncertainty SealedUncertainty `json:"uncertainty"`
 }
 
-func NewEvidenceSeal(id, caseID, deviceID, measurementID, reviewer, summary string, at time.Time) (EvidenceSeal, error) {
+func NewEvidenceSeal(id, caseID, deviceID, measurementID, reviewer, summary string, uncertainty SealedUncertainty, at time.Time) (EvidenceSeal, error) {
 	item := EvidenceSeal{
 		ID:            strings.TrimSpace(id),
 		CaseID:        strings.TrimSpace(caseID),
@@ -25,6 +28,7 @@ func NewEvidenceSeal(id, caseID, deviceID, measurementID, reviewer, summary stri
 		Reviewer:      strings.TrimSpace(reviewer),
 		Summary:       strings.TrimSpace(summary),
 		SealedAt:      at.UTC(),
+		Uncertainty:   uncertainty,
 	}
 	if err := item.Validate(); err != nil {
 		return EvidenceSeal{}, err
@@ -38,6 +42,9 @@ func (s EvidenceSeal) Validate() error {
 	}
 	if s.SealedAt.IsZero() {
 		return fmt.Errorf("%w: seal time is required", ErrInvalidInput)
+	}
+	if err := s.Uncertainty.Validate(); err != nil {
+		return err
 	}
 	return nil
 }

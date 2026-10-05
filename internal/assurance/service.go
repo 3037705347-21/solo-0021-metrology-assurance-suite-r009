@@ -247,7 +247,19 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
-		if err := item.Seal(s.now()); err != nil {
+		now := s.now()
+		evaluation, hasEvaluation := m.LatestUncertainty(item.ID)
+		var evaluationRef *domain.UncertaintyEvaluation
+		if hasEvaluation {
+			evaluationRef = &evaluation
+		}
+		issues := sealUncertaintyIssues(evaluationRef, item, measurement)
+		explanation := strings.TrimSpace(input.UncertaintyExplanation)
+		if len(issues) > 0 && explanation == "" {
+			return &domain.UncertaintyIssueError{Issues: issues}
+		}
+		frozen := domain.FreezeUncertainty(evaluationRef, measurement, issues, explanation, now)
+		if err := item.Seal(now); err != nil {
 			return err
 		}
 		seal, err := domain.NewEvidenceSeal(
@@ -257,7 +269,8 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
-			s.now(),
+			frozen,
+			now,
 		)
 		if err != nil {
 			return err
@@ -268,15 +281,21 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
+		kind := "case_sealed"
+		detail := seal.Summary
+		if len(issues) > 0 {
+			kind = "case_sealed_with_uncertainty_explanation"
+			detail = fmt.Sprintf("%s | uncertainty review explanation: %s", seal.Summary, explanation)
+		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
 			item.ID,
 			item.ID,
-			"case_sealed",
+			kind,
 			seal.Reviewer,
-			seal.Summary,
-			s.now(),
+			detail,
+			now,
 		)
 		if err != nil {
 			return err
@@ -286,6 +305,13 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		return nil
 	})
 	return result, err
+}
+
+func sealUncertaintyIssues(evaluation *domain.UncertaintyEvaluation, item domain.VerificationCase, measurement domain.Measurement) []string {
+	if evaluation == nil {
+		return []string{"measurement uncertainty evaluation is not registered: components, their basis, and the combined result are required before sealing"}
+	}
+	return evaluation.SealIssues(item, measurement)
 }
 
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
@@ -312,6 +338,9 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
+	if evaluation, exists := m.LatestUncertainty(item.ID); exists {
+		result.Uncertainty = uncertaintyView(m, item, evaluation)
+	}
 	return result
 }
 
@@ -323,6 +352,9 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal
+	}
+	if evaluation, exists := snapshot.LatestUncertainty(item.ID); exists {
+		result.Uncertainty = uncertaintyView(snapshot, item, evaluation)
 	}
 	return result
 }

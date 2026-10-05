@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,11 +36,14 @@ func main() {
 	flag.Parse()
 
 	checks := map[string]func() error{
-		"register-device":          checkRegisterDevice,
-		"open-verification-case":   checkOpenVerificationCase,
-		"record-measurement":       checkRecordMeasurement,
-		"reopen-verification-case": checkReopenVerificationCase,
-		"seal-verification":        checkSealVerification,
+		"register-device":              checkRegisterDevice,
+		"open-verification-case":       checkOpenVerificationCase,
+		"record-measurement":           checkRecordMeasurement,
+		"reopen-verification-case":     checkReopenVerificationCase,
+		"seal-verification":            checkSealVerification,
+		"uncertainty-evaluation":       checkUncertaintyEvaluation,
+		"seal-uncertainty-explanation": checkSealUncertaintyExplanation,
+		"uncertainty-guard-band":       checkUncertaintyGuardBand,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +379,570 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkUncertaintyEvaluation() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCaseRaw("MET-1501")
+	if err != nil {
+		return err
+	}
+
+	// A component without a recorded basis is rejected.
+	missingBasis, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/components", map[string]any{
+		"label":                "Device repeatability",
+		"category":             "equipment",
+		"evaluation_type":      "A",
+		"standard_uncertainty": 0.02,
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingBasis, http.StatusBadRequest); err != nil {
+		return err
+	}
+
+	first, err := h.registerComponent(caseID, map[string]any{
+		"label":                "Device repeatability",
+		"category":             "equipment",
+		"evaluation_type":      "A",
+		"standard_uncertainty": 0.02,
+		"degrees_of_freedom":   9.0,
+		"basis":                "10 repeated readings on 2026-09-30, standard deviation of the mean",
+		"record_reference":     "RR-2026-09-30-07",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	firstID, err := nestedStringPath(first.Body, "current", "components", 0, "id")
+	if err != nil {
+		return err
+	}
+	combined, err := nestedFloat(first.Body, "current", "combined_standard_uncertainty")
+	if err != nil {
+		return err
+	}
+	if mathAbs(combined-0.02) > 1e-12 {
+		return fmt.Errorf("combined standard uncertainty = %.9g, expected 0.02", combined)
+	}
+	expanded, err := nestedFloat(first.Body, "current", "expanded_uncertainty")
+	if err != nil {
+		return err
+	}
+	if mathAbs(expanded-0.04) > 1e-12 {
+		return fmt.Errorf("expanded uncertainty = %.9g, expected 0.04 at k=2", expanded)
+	}
+
+	second, err := h.registerComponent(caseID, map[string]any{
+		"label":                "Reference standard",
+		"category":             "standard",
+		"evaluation_type":      "B",
+		"standard_uncertainty": 0.03,
+		"basis":                "calibration certificate CERT-4471 expanded uncertainty 0.06 at k=2",
+		"record_reference":     "CERT-4471",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusCreated); err != nil {
+		return err
+	}
+	combined, err = nestedFloat(second.Body, "current", "combined_standard_uncertainty")
+	if err != nil {
+		return err
+	}
+	if mathAbs(combined-mathSqrt(0.02*0.02+0.03*0.03)) > 1e-12 {
+		return fmt.Errorf("RSS combined uncertainty = %.9g", combined)
+	}
+	revisions, err := nestedSlice(second.Body, "revisions")
+	if err != nil {
+		return err
+	}
+	if len(revisions) != 2 {
+		return fmt.Errorf("expected 2 revision snapshots, got %d", len(revisions))
+	}
+
+	environment, err := h.registerComponent(caseID, map[string]any{
+		"label":                "Room temperature",
+		"category":             "environment",
+		"standard_uncertainty": 0.004,
+		"basis":                "laboratory temperature log T-2026-09-30, +/-0.4 C converted to output units",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(environment, http.StatusCreated); err != nil {
+		return err
+	}
+	envID, err := nestedStringPath(environment.Body, "current", "components", 2, "id")
+	if err != nil {
+		return err
+	}
+
+	// Revising a component creates a new draft revision and keeps the old one.
+	updated, err := h.request(http.MethodPut, "/cases/"+caseID+"/uncertainty/components/"+envID, map[string]any{
+		"label":                "Room temperature",
+		"category":             "environment",
+		"standard_uncertainty": 0.005,
+		"basis":                "re-evaluated temperature log T-2026-10-02",
+		"record_reference":     "T-2026-10-02",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(updated, http.StatusOK); err != nil {
+		return err
+	}
+	revisions, err = nestedSlice(updated.Body, "revisions")
+	if err != nil {
+		return err
+	}
+	if len(revisions) != 4 {
+		return fmt.Errorf("expected 4 revision snapshots after update, got %d", len(revisions))
+	}
+
+	// Removing the first component keeps prior revisions untouched.
+	removed, err := h.request(http.MethodDelete, "/cases/"+caseID+"/uncertainty/components/"+firstID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(removed, http.StatusOK); err != nil {
+		return err
+	}
+	currentComponents, err := nestedSlicePath(removed.Body, "current", "components")
+	if err != nil {
+		return err
+	}
+	if len(currentComponents) != 2 {
+		return fmt.Errorf("expected 2 current components after removal, got %d", len(currentComponents))
+	}
+
+	// Confirmation must target an accepted measurement of the case.
+	badMeasurement, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/confirm", map[string]any{
+		"measurement_id": "measurement-9999",
+		"prepared_by":    "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(badMeasurement, http.StatusBadRequest); err != nil {
+		return err
+	}
+	measurements, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measurements, http.StatusOK); err != nil {
+		return err
+	}
+	measurementID, err := nestedStringPath(measurements.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+	confirmed, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/confirm", map[string]any{
+		"measurement_id": measurementID,
+		"prepared_by":    "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(confirmed, http.StatusOK); err != nil {
+		return err
+	}
+	status, err := nestedString(confirmed.Body, "current", "status")
+	if err != nil {
+		return err
+	}
+	if status != "confirmed" {
+		return fmt.Errorf("evaluation status = %q, expected confirmed", status)
+	}
+	supported, err := nestedBool(confirmed.Body, "current", "conformance", "conformance_supported")
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return errors.New("guard-band conformance should be supported for a small budget")
+	}
+
+	// A component change after confirmation forces the evaluation back to draft.
+	changed, err := h.request(http.MethodPut, "/cases/"+caseID+"/uncertainty/components/"+envID, map[string]any{
+		"label":                "Room temperature",
+		"category":             "environment",
+		"standard_uncertainty": 0.006,
+		"basis":                "temperature log T-2026-10-04 supersedes the earlier reading",
+		"record_reference":     "T-2026-10-04",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(changed, http.StatusOK); err != nil {
+		return err
+	}
+	status, err = nestedString(changed.Body, "current", "status")
+	if err != nil {
+		return err
+	}
+	if status != "draft" {
+		return fmt.Errorf("evaluation status after component change = %q, expected draft", status)
+	}
+	reconfirmed, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/confirm", map[string]any{
+		"measurement_id": measurementID,
+		"prepared_by":    "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reconfirmed, http.StatusOK); err != nil {
+		return err
+	}
+
+	// Seal without issues and verify the frozen basis is embedded in the seal.
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier Ma",
+		"summary":  "measurement and uncertainty budget reviewed",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	frozenRevision, err := nestedFloat(sealed.Body, "seal", "uncertainty", "revision")
+	if err != nil {
+		return err
+	}
+	if int(frozenRevision) != 8 {
+		return fmt.Errorf("frozen uncertainty revision = %.0f, expected 8", frozenRevision)
+	}
+	frozenBasis, err := nestedStringPath(sealed.Body, "seal", "uncertainty", "components", 1, "basis")
+	if err != nil {
+		return err
+	}
+	if frozenBasis != "temperature log T-2026-10-04 supersedes the earlier reading" {
+		return fmt.Errorf("frozen basis does not reconstruct the reviewed evidence: %q", frozenBasis)
+	}
+	sealedComponents, err := nestedSlicePath(sealed.Body, "seal", "uncertainty", "components")
+	if err != nil {
+		return err
+	}
+	if len(sealedComponents) != 2 {
+		return fmt.Errorf("frozen uncertainty has %d components, expected 2", len(sealedComponents))
+	}
+
+	// After sealing, uncertainty reads still reconstruct every revision and basis,
+	// but every mutation is rejected.
+	uncertainty, err := h.request(http.MethodGet, "/cases/"+caseID+"/uncertainty", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(uncertainty, http.StatusOK); err != nil {
+		return err
+	}
+	if _, err := nestedSlicePath(uncertainty.Body, "sealed", "components"); err != nil {
+		return fmt.Errorf("sealed basis missing from uncertainty read: %w", err)
+	}
+	revisions, err = nestedSlice(uncertainty.Body, "revisions")
+	if err != nil {
+		return err
+	}
+	if len(revisions) != 8 {
+		return fmt.Errorf("expected 8 preserved revisions, got %d", len(revisions))
+	}
+	forbidden, err := h.registerComponent(caseID, map[string]any{
+		"label":                "late contribution",
+		"category":             "other",
+		"standard_uncertainty": 0.001,
+		"basis":                "attempt after sealing",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(forbidden, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(forbidden, "state_conflict"); err != nil {
+		return err
+	}
+	forbiddenConfirm, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/confirm", map[string]any{
+		"measurement_id": measurementID,
+		"prepared_by":    "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(forbiddenConfirm, http.StatusConflict); err != nil {
+		return err
+	}
+
+	events, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(events, http.StatusOK); err != nil {
+		return err
+	}
+	for _, kind := range []string{
+		"uncertainty_component_registered",
+		"uncertainty_component_updated",
+		"uncertainty_component_removed",
+		"uncertainty_confirmed",
+	} {
+		if !hasEvent(events.Body, kind) {
+			return fmt.Errorf("audit event %q is missing", kind)
+		}
+	}
+	return nil
+}
+
+func checkSealUncertaintyExplanation() error {
+	h := newHarness()
+	defer h.close()
+
+	// No uncertainty work at all: sealing requires an explicit explanation.
+	caseID, err := h.readyCaseRaw("MET-1601")
+	if err != nil {
+		return err
+	}
+	blocked, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier Ma",
+		"summary":  "attempt without uncertainty budget",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blocked, "uncertainty_explanation_required"); err != nil {
+		return err
+	}
+	issues, err := nestedSlicePath(blocked.Body, "error", "issues")
+	if err != nil {
+		return err
+	}
+	if len(issues) == 0 {
+		return errors.New("seal rejection did not list concrete uncertainty issues")
+	}
+
+	// Sealing with an explicit explanation proceeds and records the explanation.
+	explained, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":                "Verifier Ma",
+		"summary":                 "accepted with documented justification",
+		"uncertainty_explanation": "reference instrument and standard are within controlled limits for this screening check; full budget to follow in corrective record CR-12",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(explained, http.StatusCreated); err != nil {
+		return err
+	}
+	required, err := nestedBool(explained.Body, "seal", "uncertainty", "explanation_required")
+	if err != nil {
+		return err
+	}
+	if !required {
+		return errors.New("seal did not mark the uncertainty explanation as required")
+	}
+	explanation, err := nestedString(explained.Body, "seal", "uncertainty", "explanation")
+	if err != nil {
+		return err
+	}
+	if explanation == "" {
+		return errors.New("seal did not preserve the reviewer explanation")
+	}
+	events, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(events, http.StatusOK); err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "case_sealed_with_uncertainty_explanation") {
+		return errors.New("explained seal audit event is missing")
+	}
+
+	// A confirmed budget that is invalidated by a later component change also
+	// blocks sealing until the reviewer explains the discrepancy.
+	secondCaseID, err := h.readyCaseRaw("MET-1602")
+	if err != nil {
+		return err
+	}
+	componentID, measurementID, err := h.smallConfirmedBudget(secondCaseID)
+	if err != nil {
+		return err
+	}
+	if _, err := h.request(http.MethodPut, "/cases/"+secondCaseID+"/uncertainty/components/"+componentID, map[string]any{
+		"label":                "Device repeatability",
+		"category":             "equipment",
+		"standard_uncertainty": 0.03,
+		"basis":                "repeated readings on 2026-10-05 after probe replacement",
+		"record_reference":     "RR-2026-10-05-02",
+		"technician":           "Rui",
+	}); err != nil {
+		return err
+	}
+	blockedDraft, err := h.request(http.MethodPost, "/cases/"+secondCaseID+"/seal", map[string]any{
+		"reviewer": "Verifier Ma",
+		"summary":  "attempt after component change",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blockedDraft, http.StatusConflict); err != nil {
+		return err
+	}
+	issues, err = nestedSlicePath(blockedDraft.Body, "error", "issues")
+	if err != nil {
+		return err
+	}
+	if len(issues) == 0 {
+		return errors.New("changed-component seal rejection listed no issues")
+	}
+	explainedDraft, err := h.request(http.MethodPost, "/cases/"+secondCaseID+"/seal", map[string]any{
+		"reviewer":                "Verifier Ma",
+		"summary":                 "accepted after reviewing the changed contribution",
+		"uncertainty_explanation": "the probe replacement was witnessed and the revised contribution still bounds the observed error for this case",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(explainedDraft, http.StatusCreated); err != nil {
+		return err
+	}
+	frozenStatus, err := nestedString(explainedDraft.Body, "seal", "uncertainty", "status")
+	if err != nil {
+		return err
+	}
+	if frozenStatus != "draft" {
+		return fmt.Errorf("frozen evaluation status = %q, expected draft", frozenStatus)
+	}
+	frozenMeasurement, err := nestedString(explainedDraft.Body, "seal", "uncertainty", "measurement_id")
+	if err != nil {
+		return err
+	}
+	if frozenMeasurement != measurementID {
+		return fmt.Errorf("frozen measurement = %q, expected %q", frozenMeasurement, measurementID)
+	}
+	return nil
+}
+
+func checkUncertaintyGuardBand() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1701")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	// Observed deviation 0.40 against tolerance 0.50.
+	recorded, err := h.recordMeasurement(caseID, 25.4, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(recorded, http.StatusCreated); err != nil {
+		return err
+	}
+	measurementID, err := nestedStringPath(recorded.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+	if _, err := h.registerComponent(caseID, map[string]any{
+		"label":                "Reference standard",
+		"category":             "standard",
+		"standard_uncertainty": 0.2,
+		"basis":                "calibration certificate CERT-9 limit dominates this near-limit result",
+		"technician":           "Rui",
+	}); err != nil {
+		return err
+	}
+	confirmed, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/confirm", map[string]any{
+		"measurement_id": measurementID,
+		"prepared_by":    "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(confirmed, http.StatusOK); err != nil {
+		return err
+	}
+	supported, err := nestedBool(confirmed.Body, "current", "conformance", "conformance_supported")
+	if err != nil {
+		return err
+	}
+	if supported {
+		return errors.New("guard band should reject conformance when |deviation| + U exceeds tolerance")
+	}
+	margin, err := nestedFloat(confirmed.Body, "current", "conformance", "guard_band_margin")
+	if err != nil {
+		return err
+	}
+	if margin >= 0 {
+		return fmt.Errorf("guard-band margin = %.9g, expected negative", margin)
+	}
+
+	// Even a confirmed evaluation must be explained when the guard band fails.
+	blocked, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier Ma",
+		"summary":  "near-limit result",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	issues, err := nestedSlicePath(blocked.Body, "error", "issues")
+	if err != nil {
+		return err
+	}
+	foundGuardIssue := false
+	for _, issue := range issues {
+		if text, ok := issue.(string); ok && strings.Contains(text, "unconditional conformance") {
+			foundGuardIssue = true
+		}
+	}
+	if !foundGuardIssue {
+		return errors.New("guard-band issue was not reported among seal issues")
+	}
+	explained, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer":                "Verifier Ma",
+		"summary":                 "accepted for rework screening, not metrological release",
+		"uncertainty_explanation": "result is only used to trigger device adjustment; the widened acceptance interval is approved by quality procedure QP-31",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(explained, http.StatusCreated); err != nil {
+		return err
+	}
+	frozenSupported, err := nestedBool(explained.Body, "seal", "uncertainty", "conformance_supported")
+	if err != nil {
+		return err
+	}
+	if frozenSupported {
+		return errors.New("frozen seal should retain the original unsupported conformance decision")
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -487,6 +1055,17 @@ func (h *harness) rejectedCase(tag string) (string, error) {
 }
 
 func (h *harness) readyCase(tag string) (string, error) {
+	caseID, err := h.readyCaseRaw(tag)
+	if err != nil {
+		return "", err
+	}
+	if _, _, err := h.smallConfirmedBudget(caseID); err != nil {
+		return "", err
+	}
+	return caseID, nil
+}
+
+func (h *harness) readyCaseRaw(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
 		return "", err
@@ -507,6 +1086,68 @@ func (h *harness) readyCase(tag string) (string, error) {
 		return "", err
 	}
 	return caseID, nil
+}
+
+func (h *harness) registerComponent(caseID string, body map[string]any) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/components", body)
+}
+
+// smallConfirmedBudget registers a small equipment/standard budget and confirms
+// it against the first accepted measurement.
+func (h *harness) smallConfirmedBudget(caseID string) (componentID, measurementID string, err error) {
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return "", "", err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return "", "", err
+	}
+	measurementID, err = nestedStringPath(read.Body, "measurements", 0, "id")
+	if err != nil {
+		return "", "", err
+	}
+	registered, err := h.registerComponent(caseID, map[string]any{
+		"label":                "Device repeatability",
+		"category":             "equipment",
+		"evaluation_type":      "A",
+		"standard_uncertainty": 0.01,
+		"degrees_of_freedom":   9.0,
+		"basis":                "10 repeated readings on 2026-09-30, standard deviation of the mean",
+		"record_reference":     "RR-2026-09-30-07",
+		"technician":           "Rui",
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if err := expectStatus(registered, http.StatusCreated); err != nil {
+		return "", "", err
+	}
+	componentID, err = nestedStringPath(registered.Body, "current", "components", 0, "id")
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := h.registerComponent(caseID, map[string]any{
+		"label":                "Reference standard",
+		"category":             "standard",
+		"evaluation_type":      "B",
+		"standard_uncertainty": 0.015,
+		"basis":                "calibration certificate CERT-4471 expanded uncertainty 0.03 at k=2",
+		"record_reference":     "CERT-4471",
+		"technician":           "Rui",
+	}); err != nil {
+		return "", "", err
+	}
+	confirmed, err := h.request(http.MethodPost, "/cases/"+caseID+"/uncertainty/confirm", map[string]any{
+		"measurement_id": measurementID,
+		"prepared_by":    "Rui",
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if err := expectStatus(confirmed, http.StatusOK); err != nil {
+		return "", "", err
+	}
+	return componentID, measurementID, nil
 }
 
 func expectStatus(response apiResponse, expected int) error {
@@ -551,6 +1192,22 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 	return flag, nil
 }
 
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
+}
+
+func mathAbs(value float64) float64 { return math.Abs(value) }
+
+func mathSqrt(value float64) float64 { return math.Sqrt(value) }
+
 func nestedSlice(root map[string]any, key string) ([]any, error) {
 	value, ok := root[key]
 	if !ok {
@@ -561,6 +1218,30 @@ func nestedSlice(root map[string]any, key string) ([]any, error) {
 		return nil, fmt.Errorf("%s is not an array", key)
 	}
 	return items, nil
+}
+
+func nestedSlicePath(root map[string]any, path ...any) ([]any, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%v is not an array", path)
+	}
+	return items, nil
+}
+
+func nestedStringPath(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
+	}
+	return text, nil
 }
 
 func hasEvent(root map[string]any, kind string) bool {

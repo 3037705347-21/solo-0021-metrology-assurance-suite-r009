@@ -28,6 +28,18 @@
       "command": "go run ./cmd/workflowcheck --workflow reopen-verification-case"
     },
     {
+      "workflow_id": "uncertainty-evaluation",
+      "command": "go run ./cmd/workflowcheck --workflow uncertainty-evaluation"
+    },
+    {
+      "workflow_id": "seal-uncertainty-explanation",
+      "command": "go run ./cmd/workflowcheck --workflow seal-uncertainty-explanation"
+    },
+    {
+      "workflow_id": "uncertainty-guard-band",
+      "command": "go run ./cmd/workflowcheck --workflow uncertainty-guard-band"
+    },
+    {
       "workflow_id": "seal-verification",
       "command": "go run ./cmd/workflowcheck --workflow seal-verification"
     }

@@ -35,6 +35,7 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 func writeError(writer http.ResponseWriter, err error) {
 	status, code := errorStatus(err)
 	message := err.Error()
+	issues := uncertaintyIssues(err)
 	if status == http.StatusInternalServerError {
 		message = "unexpected server failure"
 	}
@@ -42,8 +43,17 @@ func writeError(writer http.ResponseWriter, err error) {
 		Error: contracts.ErrorBody{
 			Code:    code,
 			Message: message,
+			Issues:  issues,
 		},
 	})
+}
+
+func uncertaintyIssues(err error) []string {
+	var issueErr *domain.UncertaintyIssueError
+	if errors.As(err, &issueErr) {
+		return append([]string(nil), issueErr.Issues...)
+	}
+	return nil
 }
 
 func errorStatus(err error) (int, string) {
@@ -58,6 +68,10 @@ func errorStatus(err error) (int, string) {
 		return http.StatusConflict, "active_case_exists"
 	case errors.Is(err, domain.ErrSealAlreadyCreated):
 		return http.StatusConflict, "seal_exists"
+	case errors.Is(err, domain.ErrEvaluationNotRegistered):
+		return http.StatusConflict, "evaluation_not_registered"
+	case errors.Is(err, domain.ErrExplanationRequired):
+		return http.StatusConflict, "uncertainty_explanation_required"
 	case errors.Is(err, domain.ErrStateConflict):
 		return http.StatusConflict, "state_conflict"
 	default:

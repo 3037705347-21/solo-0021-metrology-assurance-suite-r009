@@ -2,8 +2,9 @@
 
 Metrology Assurance Suite is a Go HTTP service for bounded laboratory
 measurement assurance work. It registers devices, opens verification cases,
-records measurements, handles failed tolerance decisions, and seals traceable
-evidence records.
+records measurements, builds documented measurement uncertainty evaluations,
+handles failed tolerance decisions, and seals traceable evidence records with
+the uncertainty basis frozen at review time.
 
 ## Run
 
@@ -21,6 +22,9 @@ go run ./cmd/workflowcheck --workflow register-device
 go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
+go run ./cmd/workflowcheck --workflow uncertainty-evaluation
+go run ./cmd/workflowcheck --workflow seal-uncertainty-explanation
+go run ./cmd/workflowcheck --workflow uncertainty-guard-band
 go run ./cmd/workflowcheck --workflow seal-verification
 ```
 
@@ -40,8 +44,34 @@ or extend these smoke checks with red/green verification tests.
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
+- `POST /cases/{id}/uncertainty/components`
+- `PUT /cases/{id}/uncertainty/components/{componentId}`
+- `DELETE /cases/{id}/uncertainty/components/{componentId}`
+- `POST /cases/{id}/uncertainty/confirm`
+- `GET /cases/{id}/uncertainty`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+
+## Measurement uncertainty
+
+Technicians register uncertainty components (equipment, reference standard,
+environment, method, other) with a standard uncertainty, sensitivity
+coefficient, A/B evaluation type, optional degrees of freedom, and a mandatory
+`basis` (with an optional record reference such as a certificate id). The
+service keeps an append-only history of evaluation revisions, combines
+components by root-sum-of-squares into `combined_standard_uncertainty`, and
+reports `expanded_uncertainty = coverage_factor * combined_standard_uncertainty`
+(default coverage factor 2). Confirmation ties a revision to one accepted
+measurement; any later component change returns the evaluation to draft.
+
+Sealing is blocked with error code `uncertainty_explanation_required` and a
+concrete `issues` list when the evaluation is missing, has components without a
+basis, was changed after confirmation, does not match the current case facts,
+or fails the guard band `|deviation| + U <= tolerance`. The verifier can supply
+`uncertainty_explanation` to seal with a documented exception. The seal stores
+a frozen copy of the components, combined result, conformance outcome, issues,
+and the explanation; `GET /cases/{id}/uncertainty` and the events endpoint
+still reconstruct that basis after sealing.
 
 ## Layout
 

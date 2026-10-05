@@ -106,3 +106,63 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	}
 	writeJSON(writer, http.StatusOK, contracts.EventsResponse{Events: view.Events})
 }
+
+func (s *Server) registerComponent(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.RegisterComponentRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.RegisterComponent(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, view)
+}
+
+func (s *Server) updateComponent(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.UpdateComponentRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.UpdateComponent(request.Context(), request.PathValue("id"), request.PathValue("componentId"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
+func (s *Server) removeComponent(writer http.ResponseWriter, request *http.Request) {
+	view, err := s.service.RemoveComponent(request.Context(), request.PathValue("id"), request.PathValue("componentId"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
+func (s *Server) confirmUncertainty(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.ConfirmEvaluationRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.ConfirmEvaluation(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
+func (s *Server) uncertainty(writer http.ResponseWriter, request *http.Request) {
+	view, err := s.service.Uncertainty(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
