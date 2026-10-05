@@ -247,6 +247,25 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
+
+		// Freeze the current uncertainty basis exactly as it is at seal time.
+		current, hasCurrent := m.CurrentEvaluation(item.ID)
+		var frozen *domain.UncertaintyEvaluation
+		if hasCurrent {
+			clone := current.Clone()
+			frozen = &clone
+		}
+		issues := uncertaintySealIssues(item, measurement, m.Evaluations(item.ID), frozen)
+		explanation := strings.TrimSpace(input.UncertaintyExplanation)
+		if len(issues) > 0 && explanation == "" {
+			return fmt.Errorf("%w: case %s cannot be sealed until an explicit uncertainty explanation is provided: %s",
+				domain.ErrUncertaintyExplanationRequired, item.ID, strings.Join(issues, "; "))
+		}
+		if len(issues) == 0 {
+			// An explanation without an issue has no meaning; keep seals clean.
+			explanation = ""
+		}
+
 		if err := item.Seal(s.now()); err != nil {
 			return err
 		}
@@ -257,6 +276,9 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
+			frozen,
+			issues,
+			explanation,
 			s.now(),
 		)
 		if err != nil {
@@ -268,6 +290,17 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
+		sealDetail := seal.Summary
+		if frozen != nil {
+			sealDetail += " " + uncertaintyEventDetail(
+				fmt.Sprintf("sealed with frozen uncertainty evaluation (measurement %s)", measurement.ID),
+				*frozen,
+			)
+		}
+		if len(issues) > 0 {
+			sealDetail += " uncertainty issues acknowledged with reviewer explanation: " + strings.Join(issues, "; ")
+			sealDetail += " explanation: " + explanation
+		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
@@ -275,7 +308,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			"case_sealed",
 			seal.Reviewer,
-			seal.Summary,
+			sealDetail,
 			s.now(),
 		)
 		if err != nil {
@@ -305,24 +338,38 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
-		Case:         item,
-		Measurements: m.Measurements(item.ID),
-		Events:       m.Events(item.ID),
+		Case:                 item,
+		Measurements:         m.Measurements(item.ID),
+		UncertaintyRevisions: m.Evaluations(item.ID),
+		Events:               m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
+		if seal.FrozenUncertainty != nil {
+			frozen := seal.FrozenUncertainty.Clone()
+			result.CurrentUncertainty = &frozen
+		}
+	} else if current, exists := m.CurrentEvaluation(item.ID); exists {
+		result.CurrentUncertainty = &current
 	}
 	return result
 }
 
 func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
-		Case:         item,
-		Measurements: snapshot.Measurements(item.ID),
-		Events:       snapshot.Events(item.ID),
+		Case:                 item,
+		Measurements:         snapshot.Measurements(item.ID),
+		UncertaintyRevisions: snapshot.Evaluations(item.ID),
+		Events:               snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal
+		if seal.FrozenUncertainty != nil {
+			frozen := seal.FrozenUncertainty.Clone()
+			result.CurrentUncertainty = &frozen
+		}
+	} else if current, exists := snapshot.CurrentEvaluation(item.ID); exists {
+		result.CurrentUncertainty = &current
 	}
 	return result
 }

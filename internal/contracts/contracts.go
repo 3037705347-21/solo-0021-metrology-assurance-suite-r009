@@ -29,6 +29,17 @@ type ReopenCaseRequest struct {
 type SealCaseRequest struct {
 	Reviewer string `json:"reviewer"`
 	Summary  string `json:"summary"`
+	// UncertaintyExplanation is required when the current uncertainty
+	// assessment cannot support sealing without explanation (missing basis,
+	// revised components, stale facts, or an indeterminate guard-band
+	// conclusion).
+	UncertaintyExplanation string `json:"uncertainty_explanation,omitempty"`
+}
+
+type RegisterUncertaintyRequest struct {
+	Technician          string                  `json:"technician"`
+	CoverageProbability float64                 `json:"coverage_probability,omitempty"`
+	Components          []domain.ComponentDraft `json:"components"`
 }
 
 type DeviceResponse struct {
@@ -36,10 +47,18 @@ type DeviceResponse struct {
 }
 
 type CaseResponse struct {
-	Case         domain.VerificationCase `json:"case"`
-	Measurements []domain.Measurement    `json:"measurements"`
-	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
-	Events       []domain.AuditEvent     `json:"events"`
+	Case                 domain.VerificationCase        `json:"case"`
+	Measurements         []domain.Measurement           `json:"measurements"`
+	Seal                 *domain.EvidenceSeal           `json:"seal,omitempty"`
+	CurrentUncertainty   *domain.UncertaintyEvaluation  `json:"current_uncertainty,omitempty"`
+	UncertaintyRevisions []domain.UncertaintyEvaluation `json:"uncertainty_revisions"`
+	Events               []domain.AuditEvent            `json:"events"`
+}
+
+type UncertaintyResponse struct {
+	CaseID    string                         `json:"case_id"`
+	Current   *domain.UncertaintyEvaluation  `json:"current,omitempty"`
+	Revisions []domain.UncertaintyEvaluation `json:"revisions"`
 }
 
 type EventsResponse struct {

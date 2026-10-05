@@ -14,6 +14,7 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	evaluations  map[string][]domain.UncertaintyEvaluation
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -24,6 +25,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		evaluations:  make(map[string][]domain.UncertaintyEvaluation),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +35,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	evaluations  map[string][]domain.UncertaintyEvaluation
 	events       []domain.AuditEvent
 }
 
@@ -62,6 +65,18 @@ func (s Snapshot) Measurements(caseID string) []domain.Measurement {
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 	item, ok := s.seals[caseID]
 	return item, ok
+}
+
+func (s Snapshot) Evaluations(caseID string) []domain.UncertaintyEvaluation {
+	return cloneEvaluations(s.evaluations[caseID])
+}
+
+func (s Snapshot) CurrentEvaluation(caseID string) (domain.UncertaintyEvaluation, bool) {
+	items := s.evaluations[caseID]
+	if len(items) == 0 {
+		return domain.UncertaintyEvaluation{}, false
+	}
+	return items[len(items)-1].Clone(), true
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
@@ -95,6 +110,7 @@ type Mutation struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	evaluations  map[string][]domain.UncertaintyEvaluation
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -189,6 +205,36 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
+// AppendEvaluation stores a new uncertainty budget revision. Revisions are
+// append-only: the repository offers no way to update or delete an earlier
+// revision, and sealed cases reject further revisions.
+func (m *Mutation) AppendEvaluation(item domain.UncertaintyEvaluation) error {
+	if _, exists := m.cases[item.CaseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
+	}
+	if _, sealed := m.seals[item.CaseID]; sealed {
+		return fmt.Errorf("%w: case %s is sealed and its uncertainty budget is fixed", domain.ErrStateConflict, item.CaseID)
+	}
+	existing := m.evaluations[item.CaseID]
+	if item.Version != len(existing)+1 {
+		return fmt.Errorf("%w: evaluation revision %d does not follow %d stored revisions", domain.ErrStateConflict, item.Version, len(existing))
+	}
+	m.evaluations[item.CaseID] = append(existing, item)
+	return nil
+}
+
+func (m *Mutation) Evaluations(caseID string) []domain.UncertaintyEvaluation {
+	return cloneEvaluations(m.evaluations[caseID])
+}
+
+func (m *Mutation) CurrentEvaluation(caseID string) (domain.UncertaintyEvaluation, bool) {
+	items := m.evaluations[caseID]
+	if len(items) == 0 {
+		return domain.UncertaintyEvaluation{}, false
+	}
+	return items[len(items)-1].Clone(), true
+}
+
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
@@ -224,6 +270,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		evaluations:  cloneEvaluationMap(r.evaluations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +281,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.evaluations = next.evaluations
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +293,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		evaluations:  cloneEvaluationMap(r.evaluations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -276,7 +325,30 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
 	for key, value := range values {
+		if value.FrozenUncertainty != nil {
+			frozen := value.FrozenUncertainty.Clone()
+			value.FrozenUncertainty = &frozen
+		}
 		result[key] = value
+	}
+	return result
+}
+
+func cloneEvaluations(values []domain.UncertaintyEvaluation) []domain.UncertaintyEvaluation {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]domain.UncertaintyEvaluation, 0, len(values))
+	for _, value := range values {
+		result = append(result, value.Clone())
+	}
+	return result
+}
+
+func cloneEvaluationMap(values map[string][]domain.UncertaintyEvaluation) map[string][]domain.UncertaintyEvaluation {
+	result := make(map[string][]domain.UncertaintyEvaluation, len(values))
+	for key, value := range values {
+		result[key] = cloneEvaluations(value)
 	}
 	return result
 }
